@@ -7,9 +7,11 @@ Group:		Qt/Qt
 License:	LGPLv2.1 with exception or GPLv3
 URL:		http://qt-project.org
 Source0:	%{name}-%{version}.tar.bz2
+ExclusiveArch:  %{ix86}
 
 BuildRequires:	pkgconfig(Qt5Core)
 BuildRequires:	pkgconfig(Qt5Gui)
+BuildRequires:	pkgconfig(Qt5DBus)
 BuildRequires:	pkgconfig(Qt5PlatformSupport)
 BuildRequires:	pkgconfig(udev)
 BuildRequires:	pkgconfig(mtdev)
