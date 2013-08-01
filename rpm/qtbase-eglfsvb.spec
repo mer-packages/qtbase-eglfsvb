@@ -1,5 +1,5 @@
 Name:		qt5-qtbase-eglfsvb
-Version:	0.0~gitc4f1f9610a
+Version:	0.2+git546c7d785f
 Release:	1%{?dist}
 Summary:	Eglfsvb
 
