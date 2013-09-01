@@ -125,6 +125,7 @@ public:
     bool m_forceToActiveWindow;
     QTouchDevice *m_device;
     bool m_typeB;
+    QTransform m_rotate;
 };
 
 QEvdevTouchScreenData::QEvdevTouchScreenData(QEvdevTouchScreenHandler *q_ptr, const QStringList &args)
@@ -177,10 +178,24 @@ QEvdevTouchScreenHandler::QEvdevTouchScreenHandler(const QString &specification,
 
     QStringList args = spec.split(QLatin1Char(':'));
 
+    int rotationAngle = 0;
     for (int i = 0; i < args.count(); ++i) {
-        if (args.at(i).startsWith(QLatin1String("/dev/"))) {
+        if (args.at(i).startsWith(QLatin1String("/dev/")) && dev.isEmpty()) {
             dev = args.at(i);
-            break;
+        } else if (args.at(i).startsWith(QLatin1String("rotate"))) {
+            QString rotateArg = args.at(i).section(QLatin1Char('='), 1, 1);
+            bool ok;
+            uint argValue = rotateArg.toUInt(&ok);
+            if (ok) {
+                switch (argValue) {
+                case 90:
+                case 180:
+                case 270:
+                    rotationAngle = argValue;
+                default:
+                    break;
+                }
+            }
         }
     }
 
@@ -265,6 +280,9 @@ QEvdevTouchScreenHandler::QEvdevTouchScreenHandler(const QString &specification,
 #endif
     qDebug("Protocol type %c %s", d->m_typeB ? 'B' : 'A', mtdevStr);
 
+    if (rotationAngle)
+        d->m_rotate = QTransform::fromTranslate(0.5, 0.5).rotate(rotationAngle).translate(-0.5, -0.5);
+
     d->registerDevice();
 }
 
@@ -286,40 +304,51 @@ QEvdevTouchScreenHandler::~QEvdevTouchScreenHandler()
 void QEvdevTouchScreenHandler::readData()
 {
     ::input_event buffer[32];
-    int n = 0;
-    for (; ;) {
+
+
 #ifdef USE_MTDEV
-        int result = mtdev_get(m_mtdev, m_fd, buffer, sizeof(buffer) / sizeof(::input_event));
-        if (result > 0)
-            result *= sizeof(::input_event);
+    int events = 0;
+
+    do {
+        do {
+            events = mtdev_get(m_mtdev, m_fd, buffer, sizeof(buffer) / sizeof(::input_event));
+            // keep trying mtdev_get if we get interrupted. note that we do not
+            // (and should not) handle EAGAIN; EAGAIN means that reading would
+            // block and we'll get back here later to try again anyway.
+        } while (errno == EINTR);
+
+        // 0 events is EOF, -1 means error, handle both in the same place
+        if (events < 1)
+            goto err;
+
+        // process our shiny new events
+        for (int i = 0; i < events; ++i)
+            d->processInputEvent(&buffer[i]);
+
+        // keep going as long as we processed at least one event
+    } while (events >= 1);
 #else
-        int result = QT_READ(m_fd, reinterpret_cast<char*>(buffer) + n, sizeof(buffer) - n);
+    qFatal("Implement me");
 #endif
-        if (!result) {
-            qWarning("Got EOF from input device");
-            return;
-        } else if (result < 0) {
-            if (errno != EINTR && errno != EAGAIN) {
-                qWarning("Could not read from input device: %s", strerror(errno));
-                if (errno == ENODEV) { // device got disconnected -> stop reading
-                    delete m_notify;
-                    m_notify = 0;
-                    QT_CLOSE(m_fd);
-                    m_fd = -1;
-                }
-                return;
+
+    return;
+
+err:
+    if (!events) {
+        qWarning("Got EOF from input device");
+        return;
+    } else if (events < 0) {
+        if (errno != EINTR && errno != EAGAIN) {
+            qWarning("Could not read from input device: %s", strerror(errno));
+            if (errno == ENODEV) { // device got disconnected -> stop reading
+                delete m_notify;
+                m_notify = 0;
+                QT_CLOSE(m_fd);
+                m_fd = -1;
             }
-        } else {
-            n += result;
-            if (n % sizeof(::input_event) == 0)
-                break;
+            return;
         }
     }
-
-    n /= sizeof(::input_event);
-
-    for (int i = 0; i < n; ++i)
-        d->processInputEvent(&buffer[i]);
 }
 
 void QEvdevTouchScreenData::processInputEvent(input_event *data)
@@ -421,6 +450,11 @@ void QEvdevTouchScreenData::processInputEvent(input_event *data)
             tp.normalPosition = QPointF((contact.x - hw_range_x_min) / qreal(hw_range_x_max - hw_range_x_min),
                                         (contact.y - hw_range_y_min) / qreal(hw_range_y_max - hw_range_y_min));
 
+            if (!m_rotate.isIdentity())
+                tp.normalPosition = m_rotate.map(tp.normalPosition);
+
+            tp.rawPositions.append(QPointF(contact.x, contact.y));
+
             m_touchPoints.append(tp);
 
             if (contact.state == Qt::TouchPointReleased)
@@ -513,9 +547,10 @@ void QEvdevTouchScreenData::reportPoints()
         QWindowSystemInterface::TouchPoint &tp(m_touchPoints[i]);
 
         // Generate a screen position that is always inside the active window
-        // or the primary screen.
-        const qreal wx = winRect.left() + tp.normalPosition.x() * winRect.width();
-        const qreal wy = winRect.top() + tp.normalPosition.y() * winRect.height();
+        // or the primary screen.  Even though we report this as a QRectF, internally
+        // Qt uses QRect/QPoint so we need to bound the size to winRect.size() - QSize(1, 1)
+        const qreal wx = winRect.left() + tp.normalPosition.x() * (winRect.width() - 1);
+        const qreal wy = winRect.top() + tp.normalPosition.y() * (winRect.height() - 1);
         const qreal sizeRatio = (winRect.width() + winRect.height()) / qreal(hw_w + hw_h);
         if (tp.area.width() == -1) // touch major was not provided
             tp.area = QRectF(0, 0, 8, 8);
@@ -537,21 +572,16 @@ void QEvdevTouchScreenData::reportPoints()
 QEvdevTouchScreenHandlerThread::QEvdevTouchScreenHandlerThread(const QString &spec, QObject *parent)
     : QThread(parent), m_spec(spec), m_handler(0)
 {
-    start();
+    m_handler = new QEvdevTouchScreenHandler(spec);
 }
 
 QEvdevTouchScreenHandlerThread::~QEvdevTouchScreenHandlerThread()
 {
-    quit();
-    wait();
+    delete m_handler;
 }
 
 void QEvdevTouchScreenHandlerThread::run()
 {
-    m_handler = new QEvdevTouchScreenHandler(m_spec);
-    exec();
-    delete m_handler;
-    m_handler = 0;
 }
 
 
